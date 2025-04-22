@@ -1,0 +1,176 @@
+---
+title: "Inferring transcription-factor-associated accessibility from FL snATACseq data with ChromVar"
+output: html_notebook
+date: 'Created on: `r format(Sys.Date(), "%B %d, %Y")`'
+---
+
+This dataset contains nuclei of CD45+CD11b+F4/80+CD115+ FACS sorted monocyte enriched cells from mouse E14 fetal liver.
+```{r}
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(Seurat, lib.loc="/home/daliya/Apps/Seurat.v4"))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(cowplot))
+suppressPackageStartupMessages(library(clustree))
+suppressPackageStartupMessages(library(plotly))
+suppressPackageStartupMessages(library(chromVAR))
+suppressPackageStartupMessages(library(motifmatchr))
+suppressPackageStartupMessages(library(BiocParallel))
+suppressPackageStartupMessages(library(SCENIC))
+suppressPackageStartupMessages(library(SummarizedExperiment))
+suppressPackageStartupMessages(library(BSgenome.Mmusculus.UCSC.mm10))
+```
+
+Set the working directory
+```{r setup}
+knitr::opts_knit$set(root.dir = "~/Documents/Kia/Jonathan/JBA1-2_ATAC/results/")
+```
+
+
+```{r}
+##Setting multiprocessing options The package uses BiocParallel to do the multiprocessing
+register(MulticoreParam(8, progressbar = TRUE))
+```
+
+
+```{r}
+seur<-readRDS("FL_monocytes_snATACseq_JBA1-2.seurat.no.artefact.rds")
+dims.use=20
+DefaultAssay(seur)="peaks"
+```
+
+
+### Getting the fragment counts of the data
+```{r}
+fragment_counts <- SummarizedExperiment(assays = 
+                                          list(counts = as.matrix(seur@assays$peaks$counts)),
+                                        rowRanges = seur@assays$peaks@ranges)
+colData(fragment_counts)$depth=seur$nCount_peaks[rownames(colData(fragment_counts))]   # In order to be able to use the filterSamples function, a “depth” column with the total sequencing depth must be included in the colData in the SummarizedExperiment object.
+colData(fragment_counts)$annot.final=seur$annot.final[rownames(colData(fragment_counts))] 
+```
+
+
+### Remove all non-conventional chromosomes
+
+```{r}
+to.remove=which(!seqnames(fragment_counts@rowRanges) %in% c( paste0("chr", c(1:19, "X","Y"))))
+length(to.remove)
+```
+
+```{r}
+fragment_counts=fragment_counts[-to.remove,]
+```
+
+
+
+
+### Adding GC content
+The GC content will be used for determining background peaks. 
+```{r}
+fragment_counts<- addGCBias(fragment_counts, genome = BSgenome.Mmusculus.UCSC.mm10)
+```
+
+
+### Filtering peaks
+
+For both bulk and single cell data, peaks should be filtered based on having at least a certain number of fragments. At minimum, each peak should have at least one fragment across all the samples (it might be possible to have peaks with zero reads due to using a peak set defined by other data). Otherwise, downstream functions won’t work. The function filterPeaks will also reduce the peak set to non-overlapping peaks (keeping the peak with higher counts for peaks that overlap) if non_overlapping argument is set to TRUE (which is default).
+```{r}
+fragment_counts <- filterPeaks(fragment_counts, non_overlapping = TRUE)
+```
+
+
+
+### Get motifs and what peaks contain motifs
+The main computeDeviations function from chromVAR requires an object storing what peaks overlap what motifs or other annotations. The most common type of annotations to use for chromVAR are motifs. chromVAR has a function to make it easy to read in motifs from the JASPAR database:
+```{r}
+motifs <- getJasparMotifs(species = "Mus musculus")
+```
+
+
+The function matchMotifs from the motifmatchr package finds which peaks contain which motifs. By default, it returns a SummarizedExperiment object, which contains a sparse matrix indicating motif match or not.The function requires an input of a genome sequence, which can be provided as a BSgenome, FaFile, or DNAStringSet object.
+
+```{r}
+motif_ix <- matchMotifs(motifs, fragment_counts, 
+                        genome = BSgenome.Mmusculus.UCSC.mm10)
+```
+
+
+
+### Compute deviations
+
+The function computeDeviations returns a SummarizedExperiment with two “assays”. The first matrix (accessible via deviations(dev) or assays(dev)$deviations) will give the bias corrected “deviation” in accessibility for each set of peaks (rows) for each cell or sample (columns). This metric represent how accessible the set of peaks is relative to the expectation based on equal chromatin accessibility profiles across cells/samples, normalized by a set of background peak sets matched for GC and average accessability. The second matrix (deviationScores(dev) or assays(deviations)$z) gives the deviation Z-score, which takes into account how likely such a score would occur if randomly sampling sets of beaks with similar GC content and average accessibility.
+```{r}
+dev <- computeDeviations(object = fragment_counts, annotations = motif_ix)
+```
+```{r}
+dim(deviations(dev))
+```
+
+
+```{r}
+deviations(dev)[1:10,1:5]
+```
+
+```{r}
+deviationScores(dev)[1:10,1:5]
+```
+
+The function computeDeviations will use a set of background peaks for normalizing the deviation scores. Background peaks are peaks that are similar to a peak in GC content and average accessibility.
+
+
+
+### Variability
+
+The function computeVariability returns a data.frame that contains the variability (standard deviation of the z scores computed above across all cell/samples for a set of peaks), bootstrap confidence intervals for that variability (by resampling cells/samples), and a p-value for the variability being greater than the null hypothesis of 1.
+```{r}
+variability <- computeVariability(dev)
+```
+
+
+```{r , fig.height = 5, fig.width =5}
+plotVariability(variability, use_plotly = FALSE) 
+```
+
+
+### Visualizing Deviations
+
+Create a SeuratObject containing the deviation scores per cell and UMAP coordinates based on the ATAC data analysis
+```{r}
+counts=deviations(dev)
+rownames(counts)=sapply(strsplit(rownames(counts),"_"),"[[",2)
+seur_chromVar=CreateSeuratObject(counts=counts, meta.data = seur[[]][colnames(counts),])
+seur_chromVar<-SetAssayData(object =seur_chromVar,slot="data", assay="RNA",new.data =counts)
+seur_chromVar[["umap"]] <- CreateDimReducObject(embeddings = as.matrix(Embeddings( seur, reduction="umap")), key ="UMAP_", assay = DefaultAssay(seur_chromVar))
+seur_chromVar=ScaleData(seur_chromVar)
+Idents(seur_chromVar)=seur_chromVar$annot.final
+```
+
+
+#### Identify cell-type specific regulators following the SCENIC package vignette 
+Based on the Regulon Specificity Score (RSS) proposed by Suo et al. for the Mouse Cell Atlas in 2018, https://pubmed.ncbi.nlm.nih.gov/30404000/). Useful for big analysis with many cell types, to identify the cell-type specific regulons.
+RSS is a cell-type specificity score, calculated using Jensen-Shannon Divergence to quantify the difference between the probability distributions of a cell belonging to a specific cell type or not, based on Regulon Activity
+
+```{r}
+rss <- calcRSS(AUC=counts, cellAnnotation=seur_chromVar$annot.final)
+```
+
+```{r , fig.height = 6, fig.width =6,warning=FALSE}
+for ( i in unique(seur_chromVar$annot.final))
+print(plotRSS_oneSet_DK(rss, setName = i, n=10,max.overlaps.use=20))
+``` 
+
+
+```{r , fig.height = 6, fig.width =6}
+for ( i in c( "Klf1","RUNX1","Myb","Mafb")){
+p=FeaturePlot(seur_chromVar,i, pt.size = 0.6, slot="scale.data", order=F)+scale_color_gradient2(low="blue", mid="lightyellow",high="red") +theme(axis.line = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.ticks = element_blank() )
+print(p)
+}
+```
+
+
+```{r,warning=FALSE}
+sessionInfo()
+```
+
+
+
+

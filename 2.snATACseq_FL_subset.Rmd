@@ -1,0 +1,257 @@
+---
+title: "snATACseq fetal liver subset"
+output: html_notebook
+date: 'Created on: `r format(Sys.Date(), "%B %d, %Y")`'
+---
+
+```{r}
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(Signac))
+suppressPackageStartupMessages(library(Seurat, lib.loc="/home/daliya/Apps/Seurat.v4"))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(cowplot))
+suppressPackageStartupMessages(library(clustree))
+suppressPackageStartupMessages(library(plotly))
+suppressPackageStartupMessages(library(presto))
+suppressPackageStartupMessages(library(scater))
+suppressPackageStartupMessages(library(EnsDb.Mmusculus.v79))
+```
+
+Set the working directory
+```{r setup}
+knitr::opts_knit$set(root.dir = "~/Documents/Kia/Jonathan/JBA1-2_ATAC/results/")
+```
+
+```{r}
+seur=readRDS(paste0("Integrated.BM.and.FL_monocytes_snATACseq_JBA1-2.seurat.rds"))
+```
+
+
+```{r}
+subset=seur[,WhichCells(seur, idents=c( "FL 1", "FL 2" , "FL 3" ,  "FL 4","FL 5"))]
+```
+
+
+```{r}
+DefaultAssay(subset) <- 'peaks'
+subset <- RunTFIDF(subset, verbose=F)
+subset <- FindTopFeatures(subset, min.cutoff = 'q0', verbose=F)
+subset <- RunSVD(object = subset, verbose=F)
+```
+
+```{r , fig.height = 3.5, fig.width = 5}
+DepthCor(subset)
+```
+```{r , fig.height = 4, fig.width = 6}
+ElbowPlot(object = subset,ndims =50, reduction = "lsi")
+```
+
+```{r}
+### LSI components selection for downstream analysis
+dims.use<-20
+```
+
+
+```{r}
+subset <- RunUMAP(object = subset, reduction = 'lsi', dims = 2:dims.use, vebose=F)
+```
+
+```{r}
+gene.activities <- GeneActivity(subset)
+subset[['RNA']] <- CreateAssayObject(counts = gene.activities, verbose=F)
+subset <- NormalizeData(
+  object = subset,
+  assay = 'RNA',
+  verbose=F,
+  normalization.method = 'LogNormalize',
+  scale.factor = median(subset$nCount_RNA)
+)
+subset <- ScaleData(subset, assay = 'RNA', verbose=F)
+```
+
+
+#### Integrating with scRNA-seq data
+To help interpret the scATAC-seq data, we can classify cells based on an scRNA-seq experiment from the same biological system. We utilize methods for cross-modality integration and label transfer, described https://doi.org/10.1016/j.cell.2019.05.031. We use scRNAseq dataset of enriched monocytes from fetal liver.
+
+```{r}
+subset_rna<-readRDS("FL.Mo.Mac_JBA6-7_Mono.scRNAseq.seurat.rds")
+```
+
+```{r}
+subset_rna <- FindVariableFeatures(object = subset_rna, nfeatures = 5000, verbose=F)
+subset_rna=ScaleData(subset_rna, verbose=F)
+transfer.anchors <- FindTransferAnchors(
+  reference = subset_rna,
+  query = subset,
+  k.filter = 500, ## default 200 (k.filter filters out the cells if not in the top k.filter neighbors)
+  reference.assay = "RNA", query.assay = "RNA",
+  reduction = 'cca',
+  dims = 1:30
+)
+
+predicted.labels <- TransferData(
+  anchorset = transfer.anchors,
+  refdata = subset_rna$annot.final,
+  weight.reduction = subset[['lsi']],
+  k.weight =20,
+  dims = 2:20
+)
+
+subset <- AddMetaData(object = subset, metadata = predicted.labels)
+```
+
+
+```{r}
+subset$nCount_peaks_log=log10(subset$nCount_peaks)
+subset$nFeature_peaks_log=log10(subset$nFeature_peaks)
+subset$mitochondrial_log=log10(subset$mitochondrial)
+```
+
+```{r}
+DefaultAssay(subset) <- 'peaks'
+subset <- FindNeighbors(subset,  reduction = 'lsi',dims = 2:dims.use, verbose=F, graph.name=paste0("ATAC_snn_LSI",dims.use))
+for ( i in seq(0,2, 0.25))
+  subset <- FindClusters(subset, resolution = i, algorithm = 3, graph.name=paste0("ATAC_snn_LSI",dims.use), verbose=F) 
+```
+
+
+```{r , fig.height = 8, fig.width = 12}
+plot<-list()
+for ( res in c(0.25,0.5,0.75,1))
+  plot[[as.character(res)]]<-DimPlot(subset,label=T,repel=T, group.by = paste0("ATAC_snn_LSI",dims.use,"_res.",res), cols=cols.use)+
+                                      ggtitle(paste("LSI =",dims.use,"res=",res))
+plot_grid(plotlist=plot)
+```
+
+```{r , fig.height = 8, fig.width = 12}
+plot<-list()
+for ( res in c(1.25, 1.5, 1.75, 2))
+  plot[[as.character(res)]]<-DimPlot(subset,label=T,repel=T, group.by = paste0("ATAC_snn_LSI",dims.use,"_res.",res), cols=cols.use)+
+                                      ggtitle(paste("LSI =",dims.use,"res=",res))
+plot_grid(plotlist=plot)
+```
+
+
+
+
+
+```{r}
+res=1.25
+Idents(subset)=  paste0("ATAC_snn_LSI",dims.use,"_res.",res)
+Idents(subset)=  factor(Idents(subset),levels = 0:(length(unique(Idents(subset)))-1))
+```
+
+
+
+```{r , fig.height = 5, fig.width = 6}
+DimPlot(subset,repel =T,label=T, cols=cols.use) 
+```
+
+```{r , fig.height =6, fig.width = 10}
+DotPlot(subset,features =  c(paste0("prediction.score.",c("LMP.derived","MHCII.hi","EMP.derived","FL.Itga1.1","FL.Itga1.2","FL.Id3.1","FL.Id3.2","FL.Id3.3")),"rna_Gria3","rna_FMN1","rna_Kcnq3",paste0("prediction.score.",c("FL.Mo","FL.non.prolif","Mac.1","Mac.2")),"rna_Mki67","rna_Mcm3","nucleosome_signal","nucleosome_percentile","blacklist_ratio","TSS.enrichment","TSS.percentile","pct_reads_in_peaks","nCount_peaks_log","nFeature_peaks_log","mitochondrial_log"))+RotatedAxis() 
+```
+
+
+```{r}
+Idents(subset) <- plyr::mapvalues(x = Idents(subset), from = 0:15, 
+    to =c("FL Id3 2","FL Mo 1","FL Mo 3", "LMP-derived","EMP-derived", "FL Itga1 2",
+          "FL Id3 2","FL Mo 2","FL Id3 1","FL Itga1 2","FL Itga1 1",
+          "Artefact","Mac","FL Id3 2","Artefact","FL Id3 1"
+    ))
+Idents(subset, cells=WhichCells(subset, expression=ATAC_snn_LSI20_res.1.5==17)) ="Doublets"
+
+```
+
+```{r}
+new.order=c ( "LMP-derived", "EMP-derived","FL Itga1 1","FL Itga1 2" , "FL Id3 1","FL Id3 2", "FL Mo 1", "FL Mo 2" ,"FL Mo 3" , "Mac"    , "Artefact" ,"Doublets"  )
+new.order[!new.order %in% levels( Idents(subset))]
+levels( Idents(subset))[!levels( Idents(subset)) %in%new.order]
+```
+
+
+
+```{r}
+Idents(subset)=factor( Idents(subset), levels=new.order)
+subset$annot.final=Idents(subset)
+```
+```{r , fig.height = 6, fig.width =8}
+DimPlot(subset,repel =T,label=T, cols=cols.use) 
+```
+
+```{r , fig.height =5, fig.width = 14}
+DotPlot(subset,features =  c("prediction.score.LMP.derived","prediction.score.MHCII.hi","rna_Flt3","rna_Sorcs2","rna_Pax5","rna_Pmepa1","rna_Kit","prediction.score.EMP.derived","rna_Prtn3","rna_Ms4a3","rna_Itgb2l","rna_Mpo","rna_Lpo","rna_Mapk4", paste0("prediction.score.",c("FL.Itga1.1","FL.Itga1.2","FL.Id3.1","FL.Id3.2","FL.Id3.3")),"rna_Id3","rna_Id2","rna_Cd34","rna_Gpr97","rna_Gria3","rna_FMN1","rna_Kcnq3","rna_Itgal","rna_Gse1", "rna_Lyz2","rna_F13a1","rna_Ncf4","prediction.score.FL.Mo","rna_Mki67","rna_Mcm3",paste0("prediction.score.",c("FL.non.prolif","Mac.1","Mac.2")),"rna_C1qb","rna_Maf","rna_Apoe","nucleosome_signal","nucleosome_percentile","blacklist_ratio","TSS.enrichment","TSS.percentile","pct_reads_in_peaks","nCount_peaks_log","nFeature_peaks_log","mitochondrial_log"))+RotatedAxis() 
+```
+Transfer the annotations to the full FL + BM dataset
+```{r}
+Idents(subset)="annot.final"
+for ( i in levels(Idents(subset))) {
+  Idents(seur, cells=WhichCells(subset, idents = i))=i
+}
+```
+
+
+```{r}
+subsetnoart=seur[,WhichCells(subset, idents = c("Doublets","Artefact"), invert=T)]
+```
+
+```{r}
+DefaultAssay(subsetnoart) <- 'peaks'
+```
+
+
+```{r}
+subsetnoart <- RunTFIDF(subsetnoart, vebose=F)
+subsetnoart <- FindTopFeatures(subsetnoart, min.cutoff = 'q0', vebose=F)
+subsetnoart <- RunSVD(object = subsetnoart, vebose=F)
+```
+
+
+
+```{r , fig.height = 3.5, fig.width = 5}
+DepthCor(subsetnoart)
+```
+```{r , fig.height = 4, fig.width = 6}
+ElbowPlot(object = subsetnoart,ndims =50, reduction = "lsi")
+```
+
+
+Non-linear dimension reduction and clustering
+
+Now that the cells are embedded in a low-dimensional space we can use methods commonly applied for the analysis of scRNA-seq data to perform graph-based clustering and non-linear dimension reduction for visualization. The functions RunUMAP(), FindNeighbors(), and FindClusters() all come from the Seurat package.
+
+```{r}
+### LSI components selection for downstream analysis
+dims.use<-20
+```
+
+
+```{r}
+subsetnoart <- RunUMAP(object = subsetnoart, reduction = 'lsi', dims = 2:dims.use, vebose=F)
+```
+
+
+
+```{r , fig.height =7, fig.width = 9}
+DimPlot(subsetnoart,repel =T,label=T, cols=c( "EMP-derived"= "blue1",  "LMP-derived"  =   "violetred" , "FL Id3 1" = "mediumpurple",  "FL Id3 2" ="pink","Mac"=  "goldenrod1"  ,  "FL Mo 1" = "darkolivegreen1" , "FL Mo 2" = "purple" , "FL Mo 3" = "salmon1"  , "FL Itga1 1"="lightblue",  "FL Itga1 2" =  "dodgerblue"    )  ) 
+```
+
+
+```{r , fig.height = 6, fig.width =6}
+cluster.use= c("EMP.derived","FL.Itga1.1","FL.Itga1.2","FL.Mo","FL.non.prolif","FL.Id3.1","FL.Id3.2","FL.Id3.3","Mac.1","Mac.2","LMP.derived","MHCII.hi")
+for ( i in  cluster.use){
+p=FeaturePlot(subsetnoart,paste0("prediction.score.",i), pt.size = 0.6, order=F) +theme(axis.line = element_blank(), axis.text = element_blank(), axis.title = element_blank(), axis.ticks = element_blank() )
+print(p)
+}
+```
+
+
+```{r}
+saveRDS(subsetnoart,paste0("FL_monocytes_snATACseq_JBA1-2.seurat.no.artefact.rds"))
+```
+
+
+
+
+```{r,warning=FALSE}
+sessionInfo()
+```
